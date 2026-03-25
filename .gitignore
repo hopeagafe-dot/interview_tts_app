@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+venv/
+.venv/
+tts_output/
+output/
+dist/
+build/
+*.mp3
+*.wav
+*.srt
+*.lrc

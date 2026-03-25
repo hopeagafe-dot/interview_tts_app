@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(find \"D:/MCE/파이선으로 만든 프로그램 모음/대사\\(TXT\\)를 음성\\(MP3\\)으로 만들기/interview_tts_app\" -type f)",
+      "Bash(python -m py_compile interview_tts_generator.py)"
+    ]
+  }
+}
