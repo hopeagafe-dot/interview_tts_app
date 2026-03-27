@@ -25,17 +25,35 @@ except Exception:
 
 APP_TITLE = "Interview MP3 + Subtitle Generator"
 DEFAULT_PAUSE_MS = 1200
-DEFAULT_INTERVIEWER_VOICE = "en-US-AndrewMultilingualNeural"
-DEFAULT_CANDIDATE_VOICE = "en-US-BrianMultilingualNeural"
 
+# Voice presets: {display label shown in UI : edge-tts voice ID}
+# The StringVar stores the display label; the voice ID is resolved at generation time.
 VOICE_PRESETS = {
-    "International Male 1": "en-US-BrianMultilingualNeural",
-    "International Male 2": "en-US-AndrewMultilingualNeural",
-    "International Female 1": "en-US-AvaMultilingualNeural",
-    "International Female 2": "en-GB-SoniaNeural",
-    "Interviewer Male": "en-GB-RyanNeural",
-    "Interviewer Female": "en-GB-SoniaNeural",
+    # ── US Male ──────────────────────────────────────────────────────────
+    "[US Male]  Andrew  (Multilingual)": "en-US-AndrewMultilingualNeural",
+    "[US Male]  Brian   (Multilingual)": "en-US-BrianMultilingualNeural",
+    "[US Male]  Guy":                    "en-US-GuyNeural",
+    "[US Male]  Christopher":            "en-US-ChristopherNeural",
+    "[US Male]  Eric":                   "en-US-EricNeural",
+    "[US Male]  Roger":                  "en-US-RogerNeural",
+    # ── US Female ────────────────────────────────────────────────────────
+    "[US Female] Ava    (Multilingual)": "en-US-AvaMultilingualNeural",
+    "[US Female] Emma   (Multilingual)": "en-US-EmmaMultilingualNeural",
+    "[US Female] Jenny":                 "en-US-JennyNeural",
+    "[US Female] Aria":                  "en-US-AriaNeural",
+    "[US Female] Michelle":              "en-US-MichelleNeural",
+    "[US Female] Sara":                  "en-US-SaraNeural",
+    # ── UK Male ──────────────────────────────────────────────────────────
+    "[UK Male]  Ryan":                   "en-GB-RyanNeural",
+    "[UK Male]  Thomas":                 "en-GB-ThomasNeural",
+    # ── UK Female ────────────────────────────────────────────────────────
+    "[UK Female] Sonia":                 "en-GB-SoniaNeural",
+    "[UK Female] Libby":                 "en-GB-LibbyNeural",
+    "[UK Female] Maisie":                "en-GB-MaisieNeural",
 }
+
+DEFAULT_INTERVIEWER_VOICE = "[UK Male]  Ryan"
+DEFAULT_CANDIDATE_VOICE   = "[US Male]  Andrew  (Multilingual)"
 
 
 @dataclass
@@ -215,6 +233,34 @@ def build_lrc_for_segments(segments: List[Segment], pause_ms: int, speaking_rate
     return "\n".join(lines)
 
 
+def build_srt_for_single(seg: Segment, speaking_rate: float) -> str:
+    """Build a stand-alone SRT subtitle for one segment, starting at 00:00:00,000."""
+    entries = []
+    current_ms = 0
+    speaker = "Interviewer" if seg.role == "Q" else "Candidate"
+    for idx, sentence in enumerate(split_sentences(seg.text), start=1):
+        dur = estimate_duration_ms(sentence, rate=speaking_rate)
+        end_ms = current_ms + dur
+        entries.append(
+            f"{idx}\n{format_ms(current_ms)} --> {format_ms(end_ms)}\n[{speaker}] {sentence}\n"
+        )
+        current_ms = end_ms
+    return "\n".join(entries)
+
+
+def build_lrc_for_single(seg: Segment, speaking_rate: float) -> str:
+    """Build a stand-alone LRC lyric file for one segment, starting at [00:00.00]."""
+    lines = []
+    current_ms = 0
+    speaker = "Interviewer" if seg.role == "Q" else "Candidate"
+    for sentence in split_sentences(seg.text):
+        mm = current_ms // 60000
+        ss = (current_ms % 60000) / 1000
+        lines.append(f"[{mm:02}:{ss:05.2f}][{speaker}] {sentence}")
+        current_ms += estimate_duration_ms(sentence, rate=speaking_rate)
+    return "\n".join(lines)
+
+
 async def generate_all(
     segments: List[Segment],
     output_dir: Path,
@@ -231,7 +277,7 @@ async def generate_all(
     speaking_rate = 1.0 + (rate_pct / 100.0)
     speaking_rate = max(0.7, min(1.8, speaking_rate))
 
-    # Individual files
+    # Individual files — mp3 + matching .srt / .lrc per segment
     for i, seg in enumerate(segments, start=1):
         prefix = f"{i:02d}_{sanitize_filename(seg.title)}"
         mp3_path = output_dir / f"{prefix}.mp3"
@@ -240,6 +286,14 @@ async def generate_all(
             status_cb(f"Generating {mp3_path.name} ...")
         await tts_edge_save(seg.text, voice, rate_pct, pitch_hz, mp3_path)
         audio_files.append(mp3_path)
+
+        # Per-segment subtitle files (same stem as the mp3)
+        (output_dir / f"{prefix}.srt").write_text(
+            build_srt_for_single(seg, speaking_rate), encoding="utf-8"
+        )
+        (output_dir / f"{prefix}.lrc").write_text(
+            build_lrc_for_single(seg, speaking_rate), encoding="utf-8"
+        )
 
     # Full combined script text for user to merge externally if desired
     full_script_path = output_dir / "full_script_for_batch_reading.txt"
@@ -339,11 +393,18 @@ class App:
         # 3) Voice & Timing
         voice = ttk.LabelFrame(frm, text="3) Voice & Timing", padding=10)
         voice.pack(fill="x", pady=6)
-        ttk.Label(voice, text="Interviewer voice").grid(row=0, column=0, sticky="w")
-        interviewer_combo = ttk.Combobox(voice, values=list(VOICE_PRESETS.values()), textvariable=self.interviewer_voice, width=38)
+        voice_labels = list(VOICE_PRESETS.keys())
+        ttk.Label(voice, text="Interviewer voice  (gender / accent)").grid(row=0, column=0, sticky="w")
+        interviewer_combo = ttk.Combobox(
+            voice, values=voice_labels, textvariable=self.interviewer_voice,
+            width=40, state="readonly",
+        )
         interviewer_combo.grid(row=1, column=0, sticky="w", padx=(0, 12))
-        ttk.Label(voice, text="Candidate voice").grid(row=0, column=1, sticky="w")
-        candidate_combo = ttk.Combobox(voice, values=list(VOICE_PRESETS.values()), textvariable=self.candidate_voice, width=38)
+        ttk.Label(voice, text="Candidate voice  (gender / accent)").grid(row=0, column=1, sticky="w")
+        candidate_combo = ttk.Combobox(
+            voice, values=voice_labels, textvariable=self.candidate_voice,
+            width=40, state="readonly",
+        )
         candidate_combo.grid(row=1, column=1, sticky="w")
         ttk.Label(voice, text="Speed (%)").grid(row=2, column=0, sticky="w", pady=(10, 0))
         ttk.Spinbox(voice, from_=-50, to=50, textvariable=self.rate_pct, width=10).grid(row=3, column=0, sticky="w")
@@ -400,11 +461,19 @@ class App:
             if edge_tts is None:
                 raise RuntimeError("Missing package: edge-tts. Run: pip install edge-tts")
 
+            # Resolve display label → edge-tts voice ID.
+            # Falls back to the raw value if the user somehow entered an ID directly.
+            interviewer_voice_id = VOICE_PRESETS.get(
+                self.interviewer_voice.get(), self.interviewer_voice.get()
+            )
+            candidate_voice_id = VOICE_PRESETS.get(
+                self.candidate_voice.get(), self.candidate_voice.get()
+            )
             asyncio.run(generate_all(
                 segments=segments,
                 output_dir=output_dir,
-                interviewer_voice=self.interviewer_voice.get(),
-                candidate_voice=self.candidate_voice.get(),
+                interviewer_voice=interviewer_voice_id,
+                candidate_voice=candidate_voice_id,
                 rate_pct=self.rate_pct.get(),
                 pitch_hz=self.pitch_hz.get(),
                 pause_ms=self.pause_ms.get(),
