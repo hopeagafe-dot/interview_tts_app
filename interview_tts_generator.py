@@ -327,9 +327,10 @@ class App:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title(APP_TITLE)
-        self.root.geometry("900x700")
-        self.root.minsize(680, 400)
+        self.root.geometry("860x680")
+        self.root.minsize(700, 500)
 
+        # --- 변수 정의 ---
         self.input_path = tk.StringVar()
         self.output_dir = tk.StringVar(value=str(Path.cwd() / "tts_output"))
         self.interviewer_voice = tk.StringVar(value=DEFAULT_INTERVIEWER_VOICE)
@@ -339,26 +340,91 @@ class App:
         self.pause_ms = tk.IntVar(value=DEFAULT_PAUSE_MS)
         self.status = tk.StringVar(value="Ready")
 
+        # --- 스타일 및 색상 테마 설정 ---
+        self.style = ttk.Style()
+        self.style.theme_use("clam")  # 모던한 테마 기반
+
+        # 주요 색상 정의
+        self.color_primary = "#2B5797"    # 로고의 블루 계열 (프로페셔널한 느낌)
+        self.color_secondary = "#E1E1E1"  # 연한 회색 (배경)
+        self.color_accent = "#D9534F"     # 로고의 레드 계열 (포인트)
+        self.color_text = "#333333"       # 진한 회색 (텍스트)
+        self.color_white = "#FFFFFF"
+
+        # Ttk 스타일 — 기본값: 흰색 배경 + Segoe UI (Windows 선명 렌더링)
+        self.style.configure(".",
+                             background=self.color_white, foreground=self.color_text)
+        self.style.configure("TLabel",
+                             background=self.color_white, font=("Segoe UI", 10))
+        self.style.configure("TEntry",
+                             fieldbackground=self.color_white, borderwidth=1, relief="solid")
+        self.style.configure("TCombobox",
+                             fieldbackground=self.color_white, borderwidth=1, relief="solid")
+        self.style.configure("TSpinbox",
+                             fieldbackground=self.color_white, borderwidth=1, relief="solid")
+        self.style.configure("TLabelframe",
+                             background=self.color_white, borderwidth=1, relief="solid")
+        self.style.configure("TLabelframe.Label",
+                             background=self.color_white,
+                             foreground=self.color_primary,
+                             font=("Segoe UI", 11, "bold"))
+        # 헤더 전용 스타일 — 회색 배경
+        self.style.configure("Header.TFrame", background=self.color_secondary)
+        self.style.configure("Header.TLabel", background=self.color_secondary,
+                             font=("Segoe UI", 10))
+
         self._build_ui()
 
     def _build_ui(self):
-        # Pin the action bar to the bottom of root FIRST so it is always visible
-        # regardless of window height. tkinter allocates space in pack order.
-        bottom = ttk.Frame(self.root, padding=(12, 6))
-        bottom.pack(side="bottom", fill="x")
-        ttk.Button(bottom, text="Generate MP3 + SRT", command=self.start_generation).pack(side="left")
-        ttk.Label(bottom, textvariable=self.status).pack(side="left", padx=12)
+        self.root.configure(background=self.color_secondary)
 
+        # 상단 헤더 — 회색 배경 유지
+        header_frame = ttk.Frame(self.root, style="Header.TFrame", padding=(16, 8))
+        header_frame.pack(side="top", fill="x")
+
+        # MCE 로고 (694×731 원본 → subsample(10,10) ≈ 69×73 px)
+        logo_path = Path(__file__).parent / "MCE_logo.png"
+        if logo_path.exists():
+            self.logo_img = tk.PhotoImage(file=str(logo_path)).subsample(10, 10)
+            ttk.Label(header_frame, image=self.logo_img,
+                      style="Header.TLabel").pack(side="left", padx=(0, 12))
+
+        ttk.Label(header_frame, text=APP_TITLE,
+                  font=("Segoe UI", 18, "bold"),
+                  foreground=self.color_primary,
+                  style="Header.TLabel").pack(side="left")
+
+        ttk.Separator(self.root, orient="horizontal").pack(side="top", fill="x")
+
+        # --- 하단 액션 바: canvas보다 먼저 pack해야 항상 보임 ---
+        # tkinter pack은 선언 순서대로 공간을 배분하므로,
+        # bottom_bar를 canvas(expand=True)보다 먼저 선언해야 공간이 확보됨.
         ttk.Separator(self.root, orient="horizontal").pack(side="bottom", fill="x")
+        bottom_bar = ttk.Frame(self.root, style="TFrame", padding=(20, 10))
+        bottom_bar.pack(side="bottom", fill="x")
 
-        # Scrollable area for form sections
-        canvas = tk.Canvas(self.root, borderwidth=0, highlightthickness=0)
+        self.progress = ttk.Progressbar(bottom_bar, mode="indeterminate", length=120)
+        self.progress.pack(side="left", padx=(0, 12))
+        ttk.Label(bottom_bar, textvariable=self.status,
+                  font=("Segoe UI", 10, "italic")).pack(side="left")
+        # Generate 버튼: tk.Button으로 relief="raised" 3D 효과
+        tk.Button(
+            bottom_bar, text="  Generate MP3 + SRT  ",
+            bg=self.color_accent, fg="white",
+            activebackground="#A93226", activeforeground="white",
+            relief="raised", bd=3, cursor="hand2",
+            font=("Segoe UI", 10, "bold"),
+            command=self.start_generation,
+        ).pack(side="right", pady=3)
+
+        # 메인 콘텐츠 영역 (스크롤 가능) — canvas는 반드시 마지막에 pack
+        canvas = tk.Canvas(self.root, borderwidth=0, highlightthickness=0, background=self.color_white)
         scrollbar = ttk.Scrollbar(self.root, orient="vertical", command=canvas.yview)
         canvas.configure(yscrollcommand=scrollbar.set)
         scrollbar.pack(side="right", fill="y")
         canvas.pack(side="left", fill="both", expand=True)
 
-        frm = ttk.Frame(canvas, padding=12)
+        frm = ttk.Frame(canvas, padding=20, style="TFrame")
         canvas_win = canvas.create_window((0, 0), window=frm, anchor="nw")
 
         def _on_frame_resize(event):
@@ -374,59 +440,92 @@ class App:
         canvas.bind("<Configure>", _on_canvas_resize)
         canvas.bind_all("<MouseWheel>", _on_mousewheel)
 
-        # 1) Input Script
-        top = ttk.LabelFrame(frm, text="1) Input Script", padding=10)
-        top.pack(fill="x", pady=6)
-        ttk.Label(top, text="Input file (.txt / .docx / .csv)").grid(row=0, column=0, sticky="w")
-        ttk.Entry(top, textvariable=self.input_path, width=80).grid(row=1, column=0, padx=(0, 8), sticky="ew")
-        ttk.Button(top, text="Browse", command=self.browse_input).grid(row=1, column=1)
-        top.columnconfigure(0, weight=1)
 
-        # 2) Output
-        mid = ttk.LabelFrame(frm, text="2) Output", padding=10)
-        mid.pack(fill="x", pady=6)
-        ttk.Label(mid, text="Output folder").grid(row=0, column=0, sticky="w")
-        ttk.Entry(mid, textvariable=self.output_dir, width=80).grid(row=1, column=0, padx=(0, 8), sticky="ew")
-        ttk.Button(mid, text="Browse", command=self.browse_output).grid(row=1, column=1)
-        mid.columnconfigure(0, weight=1)
+        # --- 각 섹션 카드 디자인 및 배치 ---
+
+        # 1) Input Script
+        input_frame = ttk.LabelFrame(
+            frm, text="1) Input Script :  Input file (.txt / .docx / .csv)",
+            padding=(10, 6), style="TLabelframe")
+        input_frame.pack(fill="x", pady=(0, 6))
+        input_entry = ttk.Entry(input_frame, textvariable=self.input_path)
+        input_entry.grid(row=0, column=0, padx=(0, 8), sticky="ew")
+        tk.Button(input_frame, text="Browse",
+                  bg=self.color_primary, fg="white",
+                  activebackground="#1A3F7A", activeforeground="white",
+                  relief="raised", bd=2, cursor="hand2",
+                  font=("Segoe UI", 9, "bold"), padx=10, pady=2,
+                  command=self.browse_input).grid(row=0, column=1)
+        input_frame.columnconfigure(0, weight=1)
+
+        # 2) Output Settings
+        output_frame = ttk.LabelFrame(
+            frm, text="2) Output Settings :  Output folder",
+            padding=(10, 6), style="TLabelframe")
+        output_frame.pack(fill="x", pady=6)
+        output_entry = ttk.Entry(output_frame, textvariable=self.output_dir)
+        output_entry.grid(row=0, column=0, padx=(0, 8), sticky="ew")
+        tk.Button(output_frame, text="Browse",
+                  bg=self.color_primary, fg="white",
+                  activebackground="#1A3F7A", activeforeground="white",
+                  relief="raised", bd=2, cursor="hand2",
+                  font=("Segoe UI", 9, "bold"), padx=10, pady=2,
+                  command=self.browse_output).grid(row=0, column=1)
+        output_frame.columnconfigure(0, weight=1)
 
         # 3) Voice & Timing
-        voice = ttk.LabelFrame(frm, text="3) Voice & Timing", padding=10)
-        voice.pack(fill="x", pady=6)
+        settings_frame = ttk.LabelFrame(frm, text="3) Voice & Timing",
+                                         padding=(10, 6), style="TLabelframe")
+        settings_frame.pack(fill="x", pady=6)
+        
         voice_labels = list(VOICE_PRESETS.keys())
-        ttk.Label(voice, text="Interviewer voice  (gender / accent)").grid(row=0, column=0, sticky="w")
-        interviewer_combo = ttk.Combobox(
-            voice, values=voice_labels, textvariable=self.interviewer_voice,
-            width=40, state="readonly",
-        )
-        interviewer_combo.grid(row=1, column=0, sticky="w", padx=(0, 12))
-        ttk.Label(voice, text="Candidate voice  (gender / accent)").grid(row=0, column=1, sticky="w")
-        candidate_combo = ttk.Combobox(
-            voice, values=voice_labels, textvariable=self.candidate_voice,
-            width=40, state="readonly",
-        )
-        candidate_combo.grid(row=1, column=1, sticky="w")
-        ttk.Label(voice, text="Speed (%)").grid(row=2, column=0, sticky="w", pady=(10, 0))
-        ttk.Spinbox(voice, from_=-50, to=50, textvariable=self.rate_pct, width=10).grid(row=3, column=0, sticky="w")
-        ttk.Label(voice, text="Pitch (Hz)").grid(row=2, column=1, sticky="w", pady=(10, 0))
-        ttk.Spinbox(voice, from_=-50, to=50, textvariable=self.pitch_hz, width=10).grid(row=3, column=1, sticky="w")
-        ttk.Label(voice, text="Pause after each Q/A (ms)").grid(row=4, column=0, sticky="w", pady=(10, 0))
-        ttk.Spinbox(voice, from_=0, to=5000, increment=100, textvariable=self.pause_ms, width=10).grid(row=5, column=0, sticky="w")
+        
+        # 음성 선택
+        ttk.Label(settings_frame, text="Interviewer voice", style="TLabel").grid(row=0, column=0, sticky="w", pady=(0, 5))
+        interviewer_combo = ttk.Combobox(settings_frame, values=voice_labels, textvariable=self.interviewer_voice, style="TCombobox", state="readonly")
+        interviewer_combo.grid(row=1, column=0, sticky="ew", padx=(0, 15))
+        
+        ttk.Label(settings_frame, text="Candidate voice", style="TLabel").grid(row=0, column=1, sticky="w", pady=(0, 5))
+        candidate_combo = ttk.Combobox(settings_frame, values=voice_labels, textvariable=self.candidate_voice, style="TCombobox", state="readonly")
+        candidate_combo.grid(row=1, column=1, sticky="ew")
+        
+        settings_frame.columnconfigure(0, weight=1)
+        settings_frame.columnconfigure(1, weight=1)
+
+        # 상세 설정 (속도, 피치, 포즈)
+        details_frame = ttk.Frame(settings_frame, padding=(0, 8, 0, 0))
+        details_frame.grid(row=2, column=0, columnspan=2, sticky="ew")
+        
+        ttk.Label(details_frame, text="Speed (%)", style="TLabel").grid(row=0, column=0, sticky="w", pady=(0, 5))
+        ttk.Spinbox(details_frame, from_=-50, to=50, textvariable=self.rate_pct, style="TSpinbox", width=10).grid(row=1, column=0, sticky="w", padx=(0, 20))
+        
+        ttk.Label(details_frame, text="Pitch (Hz)", style="TLabel").grid(row=0, column=1, sticky="w", pady=(0, 5))
+        ttk.Spinbox(details_frame, from_=-50, to=50, textvariable=self.pitch_hz, style="TSpinbox", width=10).grid(row=1, column=1, sticky="w", padx=(0, 20))
+        
+        ttk.Label(details_frame, text="Pause after Q/A (ms)", style="TLabel").grid(row=0, column=2, sticky="w", pady=(0, 5))
+        ttk.Spinbox(details_frame, from_=0, to=5000, increment=100, textvariable=self.pause_ms, style="TSpinbox", width=15).grid(row=1, column=2, sticky="w")
 
         # 4) Script Format Example
-        preview = ttk.LabelFrame(frm, text="4) Script Format Example", padding=10)
-        preview.pack(fill="x", pady=6)
+        preview_frame = ttk.LabelFrame(frm, text="4) Script Format Example",
+                                        padding=(10, 6), style="TLabelframe")
+        preview_frame.pack(fill="x", pady=6)
+
         sample = (
             "Q: Please introduce yourself.\n"
             "A: My name is Lee, and I have worked in marine engineering for more than twenty years...\n\n"
             "Q: Why do you want to join Seapeak?\n"
             "A: I am interested in Seapeak because the company has a strong safety culture...\n"
         )
-        txt = tk.Text(preview, height=8, wrap="word")
+        txt = tk.Text(preview_frame, height=7, wrap="word", font=("Consolas", 10),
+                      background=self.color_white, foreground=self.color_text,
+                      borderwidth=1, relief="solid")
         txt.insert("1.0", sample)
         txt.config(state="disabled")
         txt.pack(fill="x")
 
+
+
+    # -------------------------------------------------------------------------
     def browse_input(self):
         path = filedialog.askopenfilename(filetypes=[("Supported", "*.txt *.docx *.csv"), ("All files", "*.*")])
         if path:
@@ -445,6 +544,10 @@ class App:
         if not self.input_path.get().strip():
             messagebox.showerror(APP_TITLE, "Please choose an input file first.")
             return
+        
+        # 프로그레스 바 시작 및 상태 업데이트
+        self.progress.start(10)
+        self.set_status("Starting generation...")
 
         thread = threading.Thread(target=self.run_generation, daemon=True)
         thread.start()
@@ -484,10 +587,17 @@ class App:
         except Exception as e:
             self.set_status("Error")
             messagebox.showerror(APP_TITLE, str(e))
-
+        finally:
+            # 프로그레스 바 멈춤
+            self.progress.stop()
 
 if __name__ == "__main__":
     root = tk.Tk()
+    # 창 아이콘 설정 (.ico → 윈도우 탐색기 / 작업표시줄 아이콘)
+    # PyInstaller 변환 시에도 --icon=MCE_logo.ico 옵션으로 .exe 아이콘 지정
+    ico_path = Path(__file__).parent / "MCE_logo.ico"
+    if ico_path.exists():
+        root.iconbitmap(str(ico_path))
     try:
         ttk.Style().theme_use("clam")
     except Exception:
