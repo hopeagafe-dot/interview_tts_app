@@ -8,6 +8,15 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Tuple, Optional
 
+
+def resource_path(relative: str) -> Path:
+    """PyInstaller --onefile exe와 일반 실행 모두에서 리소스 파일 경로를 반환.
+    exe 실행 시: sys._MEIPASS (임시 압축 해제 폴더)
+    일반 실행 시: 스크립트 디렉터리
+    """
+    base = Path(getattr(sys, "_MEIPASS", Path(__file__).parent))
+    return base / relative
+
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
@@ -383,7 +392,7 @@ class App:
         header_frame.pack(side="top", fill="x")
 
         # MCE 로고 (694×731 원본 → subsample(10,10) ≈ 69×73 px)
-        logo_path = Path(__file__).parent / "MCE_logo.png"
+        logo_path = resource_path("MCE_logo.png")
         if logo_path.exists():
             self.logo_img = tk.PhotoImage(file=str(logo_path)).subsample(10, 10)
             ttk.Label(header_frame, image=self.logo_img,
@@ -595,7 +604,7 @@ if __name__ == "__main__":
     root = tk.Tk()
     # 창 아이콘 설정 (.ico → 윈도우 탐색기 / 작업표시줄 아이콘)
     # PyInstaller 변환 시에도 --icon=MCE_logo.ico 옵션으로 .exe 아이콘 지정
-    ico_path = Path(__file__).parent / "MCE_logo.ico"
+    ico_path = resource_path("MCE_logo.ico")
     if ico_path.exists():
         root.iconbitmap(str(ico_path))
     try:
