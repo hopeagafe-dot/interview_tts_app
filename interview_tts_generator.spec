@@ -1,22 +1,20 @@
 # -*- mode: python ; coding: utf-8 -*-
+# collect_all() 은 datas / binaries / hiddenimports 를 한번에 수집합니다.
+# python-docx 가 의존하는 lxml 은 C 확장(.dll) 을 포함하므로 반드시 collect_all 필요.
+from PyInstaller.utils.hooks import collect_all
+
+docx_datas,  docx_binaries,  docx_hidden  = collect_all('docx')
+lxml_datas,  lxml_binaries,  lxml_hidden  = collect_all('lxml')
 
 a = Analysis(
     ['interview_tts_generator.py'],
-    # user-site-packages 경로 추가 (pip install 이 user 설치로 진행된 경우)
     pathex=['C:\\Users\\MCE\\AppData\\Roaming\\Python\\Python314\\site-packages'],
-    binaries=[],
-    # 로고/아이콘 파일을 exe 번들에 포함 (목적지: '.' = exe와 같은 위치)
+    binaries=docx_binaries + lxml_binaries,
     datas=[
         ('MCE_logo.png', '.'),
         ('MCE_logo.ico', '.'),
-    ],
-    # PyInstaller 자동 탐지 실패 패키지 명시
-    hiddenimports=[
-        'docx',
-        'docx.oxml',
-        'docx.oxml.ns',
-        'edge_tts',
-    ],
+    ] + docx_datas + lxml_datas,
+    hiddenimports=docx_hidden + lxml_hidden + ['edge_tts'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
@@ -39,7 +37,7 @@ exe = EXE(
     upx=True,
     upx_exclude=[],
     runtime_tmpdir=None,
-    console=False,          # GUI 앱 — 콘솔 창 숨김
+    console=False,
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,

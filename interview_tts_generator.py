@@ -28,8 +28,10 @@ except Exception:
 
 try:
     from docx import Document
-except Exception:
+    _docx_err = None
+except Exception as _e:
     Document = None
+    _docx_err = repr(_e)   # 실제 원인을 보존해 에러 메시지에 표시
 
 
 APP_TITLE = "Interview MP3 + Subtitle Generator"
@@ -171,7 +173,11 @@ def read_txt(path: Path) -> str:
 
 def read_docx(path: Path) -> str:
     if Document is None:
-        raise RuntimeError("python-docx is not installed. Please run: pip install python-docx")
+        detail = f"\nDetail: {_docx_err}" if _docx_err else ""
+        raise RuntimeError(
+            f"python-docx could not be loaded.{detail}\n"
+            "If running from source: pip install python-docx"
+        )
     doc = Document(str(path))
     paras = [p.text.strip() for p in doc.paragraphs if p.text.strip()]
     return "\n".join(paras)
