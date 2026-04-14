@@ -150,10 +150,15 @@ def parse_dialogue_text(raw: str) -> List[Segment]:
         # numbered question patterns like 1. Tell me about yourself
         m = re.match(r"^(\d+)\s*[.)-]\s*(.*)$", line)
         if m and len(m.group(2).split()) > 2:
+            content = m.group(2).strip()
+            # ALL-CAPS 섹션 헤더(예: "2. ENGINEERING / LNG")는 Q로 오인식하지 않음
+            if not any(c.islower() for c in content):
+                buffer.append(line)
+                continue
             flush_buffer()
             question_no += 1
             current_role = "Q"
-            buffer = [m.group(2).strip()]
+            buffer = [content]
             continue
 
         buffer.append(line)
@@ -204,13 +209,37 @@ def load_script(path: Path) -> str:
     raise ValueError("Supported input: .txt, .docx, .csv")
 
 
-async def tts_edge_save(text: str, voice: str, rate_pct: int, pitch_hz: int, out_path: Path):
+async def tts_edge_stream(
+    text: str, voice: str, rate_pct: int, pitch_hz: int, out_path: Path
+) -> List[Tuple[int, int, str]]:
+    """TTS 생성 + MP3 저장 + WordBoundary 이벤트로 실제 단어 타이밍 반환.
+
+    Returns: [(start_ms, end_ms, word), ...] — 세그먼트 시작 기준 상대 시간(ms).
+    edge-tts 스트리밍 실패 시 communicate.save() 로 폴백하며 빈 리스트 반환.
+    """
     if edge_tts is None:
         raise RuntimeError("edge-tts is not installed. Please run: pip install edge-tts")
     rate = f"{rate_pct:+d}%"
     pitch = f"{pitch_hz:+d}Hz"
-    communicate = edge_tts.Communicate(text=text, voice=voice, rate=rate, pitch=pitch)
-    await communicate.save(str(out_path))
+
+    audio_chunks: List[bytes] = []
+    timings: List[Tuple[int, int, str]] = []
+    try:
+        communicate = edge_tts.Communicate(text=text, voice=voice, rate=rate, pitch=pitch)
+        async for event in communicate.stream():
+            if event["type"] == "audio":
+                audio_chunks.append(event["data"])
+            elif event["type"] == "WordBoundary":
+                # edge-tts 단위: 100 나노초 → //10000 으로 ms 변환
+                start_ms = event["offset"] // 10000
+                dur_ms   = event["duration"] // 10000
+                timings.append((start_ms, start_ms + dur_ms, event["text"]))
+        out_path.write_bytes(b"".join(audio_chunks))
+    except Exception:
+        # 스트리밍 미지원 버전 폴백
+        communicate = edge_tts.Communicate(text=text, voice=voice, rate=rate, pitch=pitch)
+        await communicate.save(str(out_path))
+    return timings
 
 
 def build_srt_for_segments(segments: List[Segment], pause_ms: int, speaking_rate: float) -> str:
@@ -276,6 +305,51 @@ def build_lrc_for_single(seg: Segment, speaking_rate: float) -> str:
     return "\n".join(lines)
 
 
+# ── 실제 WordBoundary 타이밍 기반 자막 빌더 ──────────────────────────────────
+_SUBTITLE_WORDS_PER_LINE = 7  # 한 자막 라인에 묶을 단어 수
+
+
+def build_srt_from_timings(
+    seg: Segment,
+    timings: List[Tuple[int, int, str]],
+    offset_ms: int = 0,
+) -> str:
+    """edge-tts WordBoundary 타이밍으로 SRT 생성. ~7 단어씩 한 라인."""
+    if not timings:
+        return ""
+    speaker = "Interviewer" if seg.role == "Q" else "Candidate"
+    entries = []
+    n = _SUBTITLE_WORDS_PER_LINE
+    for idx, i in enumerate(range(0, len(timings), n), start=1):
+        chunk = timings[i : i + n]
+        s = offset_ms + chunk[0][0]
+        e = offset_ms + chunk[-1][1]
+        text = " ".join(w for _, _, w in chunk)
+        entries.append(f"{idx}\n{format_ms(s)} --> {format_ms(e)}\n[{speaker}] {text}\n")
+    return "\n".join(entries)
+
+
+def build_lrc_from_timings(
+    seg: Segment,
+    timings: List[Tuple[int, int, str]],
+    offset_ms: int = 0,
+) -> str:
+    """edge-tts WordBoundary 타이밍으로 LRC 생성. ~7 단어씩 한 라인."""
+    if not timings:
+        return ""
+    speaker = "Interviewer" if seg.role == "Q" else "Candidate"
+    lines = []
+    n = _SUBTITLE_WORDS_PER_LINE
+    for i in range(0, len(timings), n):
+        chunk = timings[i : i + n]
+        ms = offset_ms + chunk[0][0]
+        mm = ms // 60000
+        ss = (ms % 60000) / 1000
+        text = " ".join(w for _, _, w in chunk)
+        lines.append(f"[{mm:02}:{ss:05.2f}][{speaker}] {text}")
+    return "\n".join(lines)
+
+
 async def generate_all(
     segments: List[Segment],
     output_dir: Path,
@@ -292,36 +366,87 @@ async def generate_all(
     speaking_rate = 1.0 + (rate_pct / 100.0)
     speaking_rate = max(0.7, min(1.8, speaking_rate))
 
+    # 전체 합산 자막용 누적 변수
+    full_srt_entries: List[str] = []
+    full_lrc_lines:   List[str] = []
+    srt_idx       = 1
+    full_offset_ms = 0
+
     # Individual files — mp3 + matching .srt / .lrc per segment
     for i, seg in enumerate(segments, start=1):
-        prefix = f"{i:02d}_{sanitize_filename(seg.title)}"
+        prefix   = f"{i:02d}_{sanitize_filename(seg.title)}"
         mp3_path = output_dir / f"{prefix}.mp3"
-        voice = interviewer_voice if seg.role == "Q" else candidate_voice
+        voice    = interviewer_voice if seg.role == "Q" else candidate_voice
         if status_cb:
             status_cb(f"Generating {mp3_path.name} ...")
-        await tts_edge_save(seg.text, voice, rate_pct, pitch_hz, mp3_path)
+
+        # TTS 생성 + 실제 WordBoundary 타이밍 수집
+        timings = await tts_edge_stream(seg.text, voice, rate_pct, pitch_hz, mp3_path)
         audio_files.append(mp3_path)
 
-        # Per-segment subtitle files (same stem as the mp3)
-        (output_dir / f"{prefix}.srt").write_text(
-            build_srt_for_single(seg, speaking_rate), encoding="utf-8"
-        )
-        (output_dir / f"{prefix}.lrc").write_text(
-            build_lrc_for_single(seg, speaking_rate), encoding="utf-8"
-        )
+        # 개별 자막: 실제 타이밍 우선, 없으면 추정값 폴백
+        if timings:
+            (output_dir / f"{prefix}.srt").write_text(
+                build_srt_from_timings(seg, timings), encoding="utf-8"
+            )
+            (output_dir / f"{prefix}.lrc").write_text(
+                build_lrc_from_timings(seg, timings), encoding="utf-8"
+            )
+        else:
+            (output_dir / f"{prefix}.srt").write_text(
+                build_srt_for_single(seg, speaking_rate), encoding="utf-8"
+            )
+            (output_dir / f"{prefix}.lrc").write_text(
+                build_lrc_for_single(seg, speaking_rate), encoding="utf-8"
+            )
 
-    # Full combined script text for user to merge externally if desired
+        # 전체 합산 자막 누적
+        speaker = "Interviewer" if seg.role == "Q" else "Candidate"
+        if timings:
+            n = _SUBTITLE_WORDS_PER_LINE
+            for j in range(0, len(timings), n):
+                chunk = timings[j : j + n]
+                s = full_offset_ms + chunk[0][0]
+                e = full_offset_ms + chunk[-1][1]
+                text = " ".join(w for _, _, w in chunk)
+                full_srt_entries.append(
+                    f"{srt_idx}\n{format_ms(s)} --> {format_ms(e)}\n[{speaker}] {text}\n"
+                )
+                mm = s // 60000; ss_f = (s % 60000) / 1000
+                full_lrc_lines.append(f"[{mm:02}:{ss_f:05.2f}][{speaker}] {text}")
+                srt_idx += 1
+            seg_duration_ms = timings[-1][1]
+        else:
+            inner_ms = 0
+            for sentence in split_sentences(seg.text):
+                dur = estimate_duration_ms(sentence, speaking_rate)
+                s = full_offset_ms + inner_ms
+                e = s + dur
+                full_srt_entries.append(
+                    f"{srt_idx}\n{format_ms(s)} --> {format_ms(e)}\n[{speaker}] {sentence}\n"
+                )
+                mm = s // 60000; ss_f = (s % 60000) / 1000
+                full_lrc_lines.append(f"[{mm:02}:{ss_f:05.2f}][{speaker}] {sentence}")
+                srt_idx += 1
+                inner_ms += dur
+            seg_duration_ms = inner_ms
+
+        full_offset_ms += seg_duration_ms + pause_ms
+
+    # Full combined script text
     full_script_path = output_dir / "full_script_for_batch_reading.txt"
     with open(full_script_path, "w", encoding="utf-8") as f:
         for seg in segments:
             speaker = "Interviewer" if seg.role == "Q" else "Candidate"
             f.write(f"[{speaker}] {seg.text}\n\n")
 
-    # Subtitle files
-    srt = build_srt_for_segments(segments, pause_ms, speaking_rate)
-    lrc = build_lrc_for_segments(segments, pause_ms, speaking_rate)
-    (output_dir / "full_interview_practice.srt").write_text(srt, encoding="utf-8")
-    (output_dir / "full_interview_practice.lrc").write_text(lrc, encoding="utf-8")
+    # 전체 합산 자막 저장
+    (output_dir / "full_interview_practice.srt").write_text(
+        "\n".join(full_srt_entries), encoding="utf-8"
+    )
+    (output_dir / "full_interview_practice.lrc").write_text(
+        "\n".join(full_lrc_lines), encoding="utf-8"
+    )
 
     # M3U playlist
     playlist = "#EXTM3U\n" + "\n".join(str(p.name) for p in audio_files)
