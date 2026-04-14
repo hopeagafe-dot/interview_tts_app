@@ -37,6 +37,10 @@ except Exception as _e:
 APP_TITLE = "Interview MP3 + Subtitle Generator"
 DEFAULT_PAUSE_MS = 1200
 
+
+class GenerationCancelled(Exception):
+    """Raised inside generate_all() when the user clicks Cancel."""
+
 # Voice presets: {display label shown in UI : edge-tts voice ID}
 # The StringVar stores the display label; the voice ID is resolved at generation time.
 VOICE_PRESETS = {
@@ -301,6 +305,7 @@ async def generate_all(
     pitch_hz: int,
     pause_ms: int,
     status_cb=None,
+    cancel_event: Optional[threading.Event] = None,
 ):
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -328,6 +333,10 @@ async def generate_all(
             idx += 1
 
     for pair_no, (q_seg, a_seg) in enumerate(pairs, start=1):
+        # 취소 요청 확인
+        if cancel_event and cancel_event.is_set():
+            raise GenerationCancelled()
+
         # 파일명: 01_Q01_Q&A.mp3 형식
         q_label = q_seg.title if q_seg else a_seg.title.replace("_Answer", "")
         prefix   = f"{pair_no:02d}_{q_label}_Q&A"
@@ -519,15 +528,16 @@ class App:
         self.progress.pack(side="left", padx=(0, 12))
         ttk.Label(bottom_bar, textvariable=self.status,
                   font=("Segoe UI", 10, "italic")).pack(side="left")
-        # Generate 버튼: tk.Button으로 relief="raised" 3D 효과
-        tk.Button(
+        # Generate 버튼: tk.Button으로 relief="raised" 3D 효과 (self.gen_btn 에 저장)
+        self.gen_btn = tk.Button(
             bottom_bar, text="  Generate MP3 + SRT  ",
             bg=self.color_accent, fg="white",
             activebackground="#A93226", activeforeground="white",
             relief="raised", bd=3, cursor="hand2",
             font=("Segoe UI", 10, "bold"),
             command=self.start_generation,
-        ).pack(side="right", pady=3)
+        )
+        self.gen_btn.pack(side="right", pady=3)
 
         # 메인 콘텐츠 영역 (스크롤 가능) — canvas는 반드시 마지막에 pack
         canvas = tk.Canvas(self.root, borderwidth=0, highlightthickness=0, background=self.color_white)
@@ -652,17 +662,56 @@ class App:
         self.status.set(text)
         self.root.update_idletasks()
 
+    def cancel_generation(self):
+        """Cancel 버튼 클릭 → 진행 중인 생성을 즉시 중단."""
+        if hasattr(self, "_cancel_event"):
+            self._cancel_event.set()
+        self.set_status("Cancelling...")
+
+    def _restore_gen_btn(self):
+        """Generate 버튼을 원래 상태로 복원 (main thread에서 호출)."""
+        self.gen_btn.config(
+            text="  Generate MP3 + SRT  ",
+            bg=self.color_accent,
+            activebackground="#A93226",
+            command=self.start_generation,
+        )
+
     def start_generation(self):
         if not self.input_path.get().strip():
             messagebox.showerror(APP_TITLE, "Please choose an input file first.")
             return
-        
-        # 프로그레스 바 시작 및 상태 업데이트
+
+        # ── 기존 출력 파일 존재 여부 확인 ──────────────────────────────────
+        output_dir = Path(self.output_dir.get())
+        if output_dir.exists() and any(output_dir.glob("*_Q&A.mp3")):
+            result = messagebox.askyesnocancel(
+                "Output files already exist",
+                f"Q&A MP3 files already exist in:\n{output_dir}\n\n"
+                "  Yes    →  Overwrite existing files\n"
+                "  No     →  Choose a different output folder\n"
+                "  Cancel →  Abort",
+            )
+            if result is None:          # Cancel → 중단
+                return
+            elif result is False:       # No → 새 폴더 선택
+                new_dir = filedialog.askdirectory(title="Choose output folder")
+                if not new_dir:
+                    return
+                self.output_dir.set(new_dir)
+
+        # ── Cancel 버튼으로 교체 ───────────────────────────────────────────
+        self._cancel_event = threading.Event()
+        self.gen_btn.config(
+            text="  Cancel  ",
+            bg="#888888",
+            activebackground="#666666",
+            command=self.cancel_generation,
+        )
+
         self.progress.start(10)
         self.set_status("Starting generation...")
-
-        thread = threading.Thread(target=self.run_generation, daemon=True)
-        thread.start()
+        threading.Thread(target=self.run_generation, daemon=True).start()
 
     def run_generation(self):
         try:
@@ -676,8 +725,6 @@ class App:
             if edge_tts is None:
                 raise RuntimeError("Missing package: edge-tts. Run: pip install edge-tts")
 
-            # Resolve display label → edge-tts voice ID.
-            # Falls back to the raw value if the user somehow entered an ID directly.
             interviewer_voice_id = VOICE_PRESETS.get(
                 self.interviewer_voice.get(), self.interviewer_voice.get()
             )
@@ -693,15 +740,19 @@ class App:
                 pitch_hz=self.pitch_hz.get(),
                 pause_ms=self.pause_ms.get(),
                 status_cb=self.set_status,
+                cancel_event=self._cancel_event,
             ))
             self.set_status(f"Done. Output: {output_dir}")
             messagebox.showinfo(APP_TITLE, f"Completed successfully.\n\nSaved to:\n{output_dir}")
+        except GenerationCancelled:
+            self.set_status("Generation cancelled.")
         except Exception as e:
             self.set_status("Error")
             messagebox.showerror(APP_TITLE, str(e))
         finally:
-            # 프로그레스 바 멈춤
             self.progress.stop()
+            # Generate 버튼 복원은 반드시 main thread에서 실행
+            self.root.after(0, self._restore_gen_btn)
 
 if __name__ == "__main__":
     root = tk.Tk()
