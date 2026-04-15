@@ -830,6 +830,10 @@ class App:
         threading.Thread(target=self.run_generation, daemon=True).start()
 
     def run_generation(self):
+        """백그라운드 스레드에서 실행. UI 조작은 전부 root.after()로 메인 스레드에 위임."""
+        popup_title: Optional[str] = None
+        popup_text:  Optional[str] = None
+        popup_error: bool          = False
         try:
             input_path = Path(self.input_path.get())
             output_dir = Path(self.output_dir.get())
@@ -873,16 +877,29 @@ class App:
                 cancel_event=self._cancel_event,
             ))
             self.set_status(f"Done. Output: {output_dir}")
-            messagebox.showinfo(APP_TITLE, f"Completed successfully.\n\nSaved to:\n{output_dir}")
+            popup_title = APP_TITLE
+            popup_text  = f"Completed successfully.\n\nSaved to:\n{output_dir}"
         except GenerationCancelled:
             self.set_status("Generation cancelled.")
         except Exception as e:
             self.set_status("Error")
-            messagebox.showerror(APP_TITLE, str(e))
+            popup_title = APP_TITLE
+            popup_text  = str(e)
+            popup_error = True
         finally:
             self.progress.stop()
-            # Generate 버튼 복원은 반드시 main thread에서 실행
-            self.root.after(0, self._restore_gen_btn)
+            # ── 모든 UI 복원을 메인 스레드에서 한 번에 처리 ─────────────────
+            # root.after(0, ...) 은 thread-safe: Tk 이벤트 큐에 직접 삽입됨.
+            # 버튼 복원 → 팝업 순서를 보장하기 위해 하나의 콜백으로 묶음.
+            _t, _m, _e = popup_title, popup_text, popup_error
+            def _finish():
+                self._restore_gen_btn()          # ① 버튼 먼저 복원
+                if _t and _m:
+                    if _e:
+                        messagebox.showerror(_t, _m)   # ② 에러 팝업
+                    else:
+                        messagebox.showinfo(_t, _m)    # ② 완료 팝업
+            self.root.after(0, _finish)
 
 if __name__ == "__main__":
     root = tk.Tk()
