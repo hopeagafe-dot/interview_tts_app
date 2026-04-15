@@ -299,7 +299,30 @@ async def tts_edge_stream(
 
 
 # ── 자막 엔트리 헬퍼 ──────────────────────────────────────────────────────────
-# WordBoundary = 1 단어 = 1 엔트리 (음절 수준에 가장 근접한 단위)
+_SUBTITLE_MAX_WORDS = 7   # 자막 1줄 최대 단어 수  (5~10 단어 기준 중간값)
+_SUBTITLE_MAX_CHARS = 30  # 자막 1줄 최대 글자 수  (25~30 글자 기준)
+
+
+def _chunk_words(words: List[str],
+                 max_words: int = _SUBTITLE_MAX_WORDS,
+                 max_chars: int = _SUBTITLE_MAX_CHARS) -> List[List[str]]:
+    """단어 목록을 max_words / max_chars 기준으로 청크 분할."""
+    chunks: List[List[str]] = []
+    cur: List[str] = []
+    cur_chars = 0
+    for word in words:
+        add = len(word) + (1 if cur else 0)   # +1 = 앞 공백
+        if cur and (len(cur) >= max_words or cur_chars + add > max_chars):
+            chunks.append(cur)
+            cur = [word]
+            cur_chars = len(word)
+        else:
+            cur.append(word)
+            cur_chars += add
+    if cur:
+        chunks.append(cur)
+    return chunks
+
 
 def _seg_entries(
     seg: Segment,
@@ -307,29 +330,38 @@ def _seg_entries(
     speaking_rate: float,
     base_ms: int = 0,
 ) -> List[Tuple[int, int, str]]:
-    """Return list of (start_ms, end_ms, word) — one entry per word.
+    """Return (start_ms, end_ms, text) list grouped by _chunk_words().
 
-    Uses real WordBoundary timings when available (1 word per entry).
-    Fallback: distributes estimated segment duration evenly across words.
+    WordBoundary timings → per-word timestamps merged into ~7-word chunks.
+    Fallback → sentence duration distributed proportionally across chunks.
     Speaker labels are intentionally omitted.
     """
     result: List[Tuple[int, int, str]] = []
+
     if timings:
-        # 1 단어 = 1 자막 엔트리 (WordBoundary 단위)
-        for start_ms, end_ms, word in timings:
-            result.append((base_ms + start_ms, base_ms + end_ms, word))
+        words    = [w        for _, _,  w in timings]
+        starts   = [s        for s, _,  _ in timings]
+        ends     = [e        for _, e,  _ in timings]
+        chunks   = _chunk_words(words)
+        t_idx    = 0
+        for chunk in chunks:
+            s = base_ms + starts[t_idx]
+            e = base_ms + ends[t_idx + len(chunk) - 1]
+            result.append((s, e, " ".join(chunk)))
+            t_idx += len(chunk)
     else:
-        # 폴백: 문장을 단어로 분리하고 시간을 균등 분배
         inner = 0
         for sentence in split_sentences(seg.text):
             words = sentence.split()
             if not words:
                 continue
-            dur = estimate_duration_ms(sentence, speaking_rate)
-            word_dur = max(80, dur // len(words))
-            for word in words:
-                result.append((base_ms + inner, base_ms + inner + word_dur, word))
-                inner += word_dur
+            dur        = estimate_duration_ms(sentence, speaking_rate)
+            sent_chars = max(1, len(sentence))
+            for chunk in _chunk_words(words):
+                chunk_text = " ".join(chunk)
+                chunk_dur  = max(80, int(dur * len(chunk_text) / sent_chars))
+                result.append((base_ms + inner, base_ms + inner + chunk_dur, chunk_text))
+                inner += chunk_dur
     return result
 
 
