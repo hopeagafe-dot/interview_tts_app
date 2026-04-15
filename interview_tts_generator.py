@@ -1,10 +1,12 @@
 import asyncio
 import csv
+import json
 import os
 import re
 import sys
 import threading
 from dataclasses import dataclass
+from datetime import date as _date
 from pathlib import Path
 from typing import List, Tuple, Optional
 
@@ -69,6 +71,56 @@ VOICE_PRESETS = {
 
 DEFAULT_INTERVIEWER_VOICE = "[UK Male]  Ryan"
 DEFAULT_CANDIDATE_VOICE   = "[US Male]  Andrew  (Multilingual)"
+DEFAULT_PAUSE_QNA_MS      = 2000   # inter-pair gap in merge mode
+
+
+# ── MP3 무음 프레임 (MPEG1 Layer3 128kbps 44100Hz Stereo) ─────────────────────
+# 각 프레임 = 417 bytes, 26 ms (1152 samples / 44100 Hz)
+_SILENT_MP3_FRAME = b'\xff\xfb\x90\x00' + b'\x00' * 413
+_SILENT_FRAME_MS  = 26
+
+
+def _silence_bytes(ms: int) -> bytes:
+    """Q-A 사이 또는 pair 사이에 삽입할 MP3 무음 바이트."""
+    if ms <= 0:
+        return b""
+    return _SILENT_MP3_FRAME * max(1, round(ms / _SILENT_FRAME_MS))
+
+
+# ── Config 저장/불러오기 ──────────────────────────────────────────────────────
+def _config_path() -> Path:
+    """실행 파일 옆 config.json (PyInstaller frozen exe 에서도 동작)."""
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).parent / "config.json"
+    return Path(__file__).parent / "config.json"
+
+
+def load_config() -> dict:
+    defaults = {
+        "input_path":        "",
+        "output_dir":        str(Path.cwd() / "tts_output"),
+        "interviewer_voice": DEFAULT_INTERVIEWER_VOICE,
+        "candidate_voice":   DEFAULT_CANDIDATE_VOICE,
+        "rate_pct":          0,
+        "pitch_hz":          0,
+        "pause_ms":          DEFAULT_PAUSE_MS,
+        "pause_qna_ms":      DEFAULT_PAUSE_QNA_MS,
+        "output_mode":       "split",
+    }
+    try:
+        data = json.loads(_config_path().read_text(encoding="utf-8"))
+        return {**defaults, **data}
+    except Exception:
+        return defaults
+
+
+def save_config(data: dict) -> None:
+    try:
+        _config_path().write_text(
+            json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8"
+        )
+    except Exception:
+        pass
 
 
 @dataclass
@@ -247,8 +299,7 @@ async def tts_edge_stream(
 
 
 # ── 자막 엔트리 헬퍼 ──────────────────────────────────────────────────────────
-_SUBTITLE_WORDS_PER_LINE = 7  # 한 자막 라인에 묶을 단어 수
-
+# WordBoundary = 1 단어 = 1 엔트리 (음절 수준에 가장 근접한 단위)
 
 def _seg_entries(
     seg: Segment,
@@ -256,27 +307,29 @@ def _seg_entries(
     speaking_rate: float,
     base_ms: int = 0,
 ) -> List[Tuple[int, int, str]]:
-    """Return list of (start_ms, end_ms, display_text) for one segment.
+    """Return list of (start_ms, end_ms, word) — one entry per word.
 
-    Uses real WordBoundary timings when available; falls back to WPM estimate.
-    base_ms shifts all timestamps (used to offset the A part within a Q&A pair).
+    Uses real WordBoundary timings when available (1 word per entry).
+    Fallback: distributes estimated segment duration evenly across words.
+    Speaker labels are intentionally omitted.
     """
-    speaker = "Interviewer" if seg.role == "Q" else "Candidate"
     result: List[Tuple[int, int, str]] = []
     if timings:
-        n = _SUBTITLE_WORDS_PER_LINE
-        for i in range(0, len(timings), n):
-            chunk = timings[i : i + n]
-            s = base_ms + chunk[0][0]
-            e = base_ms + chunk[-1][1]
-            text = " ".join(w for _, _, w in chunk)
-            result.append((s, e, f"[{speaker}] {text}"))
+        # 1 단어 = 1 자막 엔트리 (WordBoundary 단위)
+        for start_ms, end_ms, word in timings:
+            result.append((base_ms + start_ms, base_ms + end_ms, word))
     else:
+        # 폴백: 문장을 단어로 분리하고 시간을 균등 분배
         inner = 0
         for sentence in split_sentences(seg.text):
+            words = sentence.split()
+            if not words:
+                continue
             dur = estimate_duration_ms(sentence, speaking_rate)
-            result.append((base_ms + inner, base_ms + inner + dur, f"[{speaker}] {sentence}"))
-            inner += dur
+            word_dur = max(80, dur // len(words))
+            for word in words:
+                result.append((base_ms + inner, base_ms + inner + word_dur, word))
+                inner += word_dur
     return result
 
 
@@ -303,7 +356,9 @@ async def generate_all(
     candidate_voice: str,
     rate_pct: int,
     pitch_hz: int,
-    pause_ms: int,
+    pause_ms: int,          # Q → A 사이 무음 간격 (ms)
+    pause_qna_ms: int,      # pair → pair 사이 무음 간격 (merge 모드 전용, ms)
+    output_mode: str,       # "split" | "merge"
     status_cb=None,
     cancel_event: Optional[threading.Event] = None,
 ):
@@ -311,14 +366,10 @@ async def generate_all(
 
     audio_files: List[Path] = []
     speaking_rate = max(0.7, min(1.8, 1.0 + rate_pct / 100.0))
-
-    # 전체 합산 자막용 누적 변수
     all_entries: List[Tuple[int, int, str]] = []
     full_offset_ms = 0
 
-    # ── Q+A 세그먼트를 쌍(pair)으로 묶기 ──────────────────────────────────────
-    # 연속된 Q, A 순서이면 하나의 파일로 합침.
-    # Q만 있거나 A만 있는 경우도 처리.
+    # ── Q+A 세그먼트 → pair 목록 ──────────────────────────────────────────────
     pairs: List[Tuple[Optional[Segment], Optional[Segment]]] = []
     idx = 0
     while idx < len(segments):
@@ -332,25 +383,11 @@ async def generate_all(
             pairs.append((seg, None) if seg.role == "Q" else (None, seg))
             idx += 1
 
-    for pair_no, (q_seg, a_seg) in enumerate(pairs, start=1):
-        # 취소 요청 확인
-        if cancel_event and cancel_event.is_set():
-            raise GenerationCancelled()
-
-        # 파일명: 01_Q01_Q&A.mp3 형식
-        q_label = q_seg.title if q_seg else a_seg.title.replace("_Answer", "")
-        prefix   = f"{pair_no:02d}_{q_label}_Q&A"
-        mp3_path = output_dir / f"{prefix}.mp3"
-
-        if status_cb:
-            status_cb(f"Generating {mp3_path.name} ...")
-
-        # TTS 생성 — Q와 A를 임시 파일로 각각 생성 후 바이트 결합
-        q_bytes:   bytes                        = b""
-        a_bytes:   bytes                        = b""
-        q_timings: List[Tuple[int, int, str]]   = []
-        a_timings: List[Tuple[int, int, str]]   = []
-
+    # ── 공통: pair 하나의 TTS 생성 ─────────────────────────────────────────────
+    async def _gen_pair(pair_no, q_seg, a_seg):
+        """Returns (q_bytes, q_timings, a_bytes, a_timings, q_dur_ms, a_base)."""
+        q_bytes, q_timings = b"", []
+        a_bytes, a_timings = b"", []
         if q_seg:
             q_tmp = output_dir / f"__tmp_q{pair_no:02d}.mp3"
             q_timings = await tts_edge_stream(
@@ -358,7 +395,6 @@ async def generate_all(
             )
             q_bytes = q_tmp.read_bytes()
             q_tmp.unlink(missing_ok=True)
-
         if a_seg:
             a_tmp = output_dir / f"__tmp_a{pair_no:02d}.mp3"
             a_timings = await tts_edge_stream(
@@ -366,74 +402,114 @@ async def generate_all(
             )
             a_bytes = a_tmp.read_bytes()
             a_tmp.unlink(missing_ok=True)
-
-        # Q + A 오디오 결합 → 단일 MP3 파일
-        mp3_path.write_bytes(q_bytes + a_bytes)
-        audio_files.append(mp3_path)
-
-        # Q 재생 길이 계산 (A 자막의 base_ms 오프셋으로 사용)
-        if q_timings:
-            q_dur_ms = q_timings[-1][1]
-        elif q_seg:
-            q_dur_ms = sum(
-                estimate_duration_ms(s, speaking_rate)
-                for s in split_sentences(q_seg.text)
-            )
-        else:
-            q_dur_ms = 0
-
+        q_dur_ms = (q_timings[-1][1] if q_timings
+                    else sum(estimate_duration_ms(s, speaking_rate)
+                             for s in split_sentences(q_seg.text)) if q_seg else 0)
         a_base = q_dur_ms + pause_ms
+        return q_bytes, q_timings, a_bytes, a_timings, q_dur_ms, a_base
 
-        # 개별 pair 자막 엔트리 수집
-        pair_entries: List[Tuple[int, int, str]] = []
-        if q_seg:
-            pair_entries.extend(_seg_entries(q_seg, q_timings, speaking_rate, base_ms=0))
-        if a_seg:
-            pair_entries.extend(_seg_entries(a_seg, a_timings, speaking_rate, base_ms=a_base))
+    # ── MERGE 모드 ─────────────────────────────────────────────────────────────
+    if output_mode == "merge":
+        today_str   = _date.today().strftime("%Y-%m-%d")
+        merged_stem = f"1~{len(pairs)} Q&A ({today_str})"
+        merged_audio: bytes = b""
 
-        # 개별 pair 자막 파일 저장
-        (output_dir / f"{prefix}.srt").write_text(
-            _entries_to_srt(pair_entries), encoding="utf-8"
+        for pair_no, (q_seg, a_seg) in enumerate(pairs, start=1):
+            if cancel_event and cancel_event.is_set():
+                raise GenerationCancelled()
+            if status_cb:
+                status_cb(f"[{pair_no}/{len(pairs)}] Generating Q&A pair ...")
+
+            q_bytes, q_timings, a_bytes, a_timings, q_dur_ms, a_base = \
+                await _gen_pair(pair_no, q_seg, a_seg)
+
+            # Q + 무음(pause_ms) + A
+            merged_audio += q_bytes + _silence_bytes(pause_ms) + a_bytes
+
+            # pair 사이 무음 (마지막 pair 제외)
+            if pair_no < len(pairs):
+                merged_audio += _silence_bytes(pause_qna_ms)
+
+            # 자막 엔트리 수집
+            pair_entries: List[Tuple[int, int, str]] = []
+            if q_seg:
+                pair_entries.extend(_seg_entries(q_seg, q_timings, speaking_rate, base_ms=0))
+            if a_seg:
+                pair_entries.extend(_seg_entries(a_seg, a_timings, speaking_rate, base_ms=a_base))
+            for s, e, txt in pair_entries:
+                all_entries.append((full_offset_ms + s, full_offset_ms + e, txt))
+
+            # 전체 오프셋 전진
+            a_dur_ms = (a_timings[-1][1] if a_timings
+                        else sum(estimate_duration_ms(s, speaking_rate)
+                                 for s in split_sentences(a_seg.text)) if a_seg else 0)
+            pair_dur_ms = a_base + a_dur_ms
+            full_offset_ms += pair_dur_ms + (pause_qna_ms if pair_no < len(pairs) else 0)
+
+        (output_dir / f"{merged_stem}.mp3").write_bytes(merged_audio)
+        audio_files.append(output_dir / f"{merged_stem}.mp3")
+        (output_dir / f"{merged_stem}.srt").write_text(
+            _entries_to_srt(all_entries), encoding="utf-8"
         )
-        (output_dir / f"{prefix}.lrc").write_text(
-            _entries_to_lrc(pair_entries), encoding="utf-8"
+        (output_dir / f"{merged_stem}.lrc").write_text(
+            _entries_to_lrc(all_entries), encoding="utf-8"
         )
 
-        # 전체 합산 자막에 누적 (full_offset_ms 기준으로 절대 시간 변환)
-        for s, e, txt in pair_entries:
-            all_entries.append((full_offset_ms + s, full_offset_ms + e, txt))
+    # ── SPLIT 모드 ─────────────────────────────────────────────────────────────
+    else:
+        for pair_no, (q_seg, a_seg) in enumerate(pairs, start=1):
+            if cancel_event and cancel_event.is_set():
+                raise GenerationCancelled()
+            q_label  = q_seg.title if q_seg else a_seg.title.replace("_Answer", "")
+            prefix   = f"{pair_no:02d}_{q_label}_Q&A"
+            mp3_path = output_dir / f"{prefix}.mp3"
+            if status_cb:
+                status_cb(f"Generating {mp3_path.name} ...")
 
-        # 다음 pair를 위한 전체 오프셋 전진
-        if a_seg:
-            pair_dur_ms = a_base + (
-                a_timings[-1][1] if a_timings
-                else sum(estimate_duration_ms(s, speaking_rate)
-                         for s in split_sentences(a_seg.text))
+            q_bytes, q_timings, a_bytes, a_timings, q_dur_ms, a_base = \
+                await _gen_pair(pair_no, q_seg, a_seg)
+
+            # Q + 무음(pause_ms) + A → 단일 MP3
+            mp3_path.write_bytes(q_bytes + _silence_bytes(pause_ms) + a_bytes)
+            audio_files.append(mp3_path)
+
+            pair_entries: List[Tuple[int, int, str]] = []
+            if q_seg:
+                pair_entries.extend(_seg_entries(q_seg, q_timings, speaking_rate, base_ms=0))
+            if a_seg:
+                pair_entries.extend(_seg_entries(a_seg, a_timings, speaking_rate, base_ms=a_base))
+
+            (output_dir / f"{prefix}.srt").write_text(
+                _entries_to_srt(pair_entries), encoding="utf-8"
             )
-        else:
-            pair_dur_ms = q_dur_ms
-        full_offset_ms += pair_dur_ms + pause_ms
+            (output_dir / f"{prefix}.lrc").write_text(
+                _entries_to_lrc(pair_entries), encoding="utf-8"
+            )
+            for s, e, txt in pair_entries:
+                all_entries.append((full_offset_ms + s, full_offset_ms + e, txt))
 
-    # 전체 합산 자막 저장
-    (output_dir / "full_interview_practice.srt").write_text(
-        _entries_to_srt(all_entries), encoding="utf-8"
-    )
-    (output_dir / "full_interview_practice.lrc").write_text(
-        _entries_to_lrc(all_entries), encoding="utf-8"
-    )
+            a_dur_ms = (a_timings[-1][1] if a_timings
+                        else sum(estimate_duration_ms(s, speaking_rate)
+                                 for s in split_sentences(a_seg.text)) if a_seg else 0)
+            full_offset_ms += (a_base + a_dur_ms) + pause_ms
 
-    # Full combined script text
+        (output_dir / "full_interview_practice.srt").write_text(
+            _entries_to_srt(all_entries), encoding="utf-8"
+        )
+        (output_dir / "full_interview_practice.lrc").write_text(
+            _entries_to_lrc(all_entries), encoding="utf-8"
+        )
+
+    # ── 공통 출력 파일 ──────────────────────────────────────────────────────────
     full_script_path = output_dir / "full_script_for_batch_reading.txt"
     with open(full_script_path, "w", encoding="utf-8") as f:
         for seg in segments:
             speaker = "Interviewer" if seg.role == "Q" else "Candidate"
             f.write(f"[{speaker}] {seg.text}\n\n")
 
-    # M3U playlist
     playlist = "#EXTM3U\n" + "\n".join(str(p.name) for p in audio_files)
     (output_dir / "playlist.m3u").write_text(playlist, encoding="utf-8")
 
-    # Export parsed script CSV
     with open(output_dir / "parsed_segments.csv", "w", newline="", encoding="utf-8-sig") as f:
         writer = csv.writer(f)
         writer.writerow(["No", "Role", "Text"])
@@ -451,15 +527,18 @@ class App:
         self.root.geometry("860x680")
         self.root.minsize(700, 500)
 
-        # --- 변수 정의 ---
-        self.input_path = tk.StringVar()
-        self.output_dir = tk.StringVar(value=str(Path.cwd() / "tts_output"))
-        self.interviewer_voice = tk.StringVar(value=DEFAULT_INTERVIEWER_VOICE)
-        self.candidate_voice = tk.StringVar(value=DEFAULT_CANDIDATE_VOICE)
-        self.rate_pct = tk.IntVar(value=0)
-        self.pitch_hz = tk.IntVar(value=0)
-        self.pause_ms = tk.IntVar(value=DEFAULT_PAUSE_MS)
-        self.status = tk.StringVar(value="Ready")
+        # --- 변수 정의 (config.json 에서 이전 값 복원) ---
+        cfg = load_config()
+        self.input_path        = tk.StringVar(value=cfg["input_path"])
+        self.output_dir        = tk.StringVar(value=cfg["output_dir"])
+        self.interviewer_voice = tk.StringVar(value=cfg["interviewer_voice"])
+        self.candidate_voice   = tk.StringVar(value=cfg["candidate_voice"])
+        self.rate_pct          = tk.IntVar(value=int(cfg["rate_pct"]))
+        self.pitch_hz          = tk.IntVar(value=int(cfg["pitch_hz"]))
+        self.pause_ms          = tk.IntVar(value=int(cfg["pause_ms"]))
+        self.pause_qna_ms      = tk.IntVar(value=int(cfg["pause_qna_ms"]))
+        self.output_mode       = tk.StringVar(value=cfg["output_mode"])
+        self.status            = tk.StringVar(value="Ready")
 
         # --- 스타일 및 색상 테마 설정 ---
         self.style = ttk.Style()
@@ -617,15 +696,46 @@ class App:
         # 상세 설정 (속도, 피치, 포즈)
         details_frame = ttk.Frame(settings_frame, padding=(0, 8, 0, 0))
         details_frame.grid(row=2, column=0, columnspan=2, sticky="ew")
-        
+
         ttk.Label(details_frame, text="Speed (%)", style="TLabel").grid(row=0, column=0, sticky="w", pady=(0, 5))
         ttk.Spinbox(details_frame, from_=-50, to=50, textvariable=self.rate_pct, style="TSpinbox", width=10).grid(row=1, column=0, sticky="w", padx=(0, 20))
-        
+
         ttk.Label(details_frame, text="Pitch (Hz)", style="TLabel").grid(row=0, column=1, sticky="w", pady=(0, 5))
         ttk.Spinbox(details_frame, from_=-50, to=50, textvariable=self.pitch_hz, style="TSpinbox", width=10).grid(row=1, column=1, sticky="w", padx=(0, 20))
-        
-        ttk.Label(details_frame, text="Pause after Q/A (ms)", style="TLabel").grid(row=0, column=2, sticky="w", pady=(0, 5))
-        ttk.Spinbox(details_frame, from_=0, to=5000, increment=100, textvariable=self.pause_ms, style="TSpinbox", width=15).grid(row=1, column=2, sticky="w")
+
+        ttk.Label(details_frame, text="Pause Q → A (ms)", style="TLabel").grid(row=0, column=2, sticky="w", pady=(0, 5))
+        ttk.Spinbox(details_frame, from_=0, to=5000, increment=100, textvariable=self.pause_ms, style="TSpinbox", width=14).grid(row=1, column=2, sticky="w")
+
+        # ── 출력 모드: 분리 / 통합 ──────────────────────────────────────────
+        ttk.Separator(details_frame, orient="horizontal").grid(
+            row=2, column=0, columnspan=4, sticky="ew", pady=(12, 8)
+        )
+        ttk.Label(details_frame, text="Output mode:", style="TLabel").grid(
+            row=3, column=0, sticky="w", pady=(0, 6)
+        )
+        mode_btn_frame = ttk.Frame(details_frame)
+        mode_btn_frame.grid(row=3, column=1, columnspan=3, sticky="w", pady=(0, 6))
+        ttk.Radiobutton(
+            mode_btn_frame, text="Split  — separate file per question",
+            variable=self.output_mode, value="split",
+            command=self._on_mode_change,
+        ).pack(side="left", padx=(0, 24))
+        ttk.Radiobutton(
+            mode_btn_frame, text="Merge  — single combined file",
+            variable=self.output_mode, value="merge",
+            command=self._on_mode_change,
+        ).pack(side="left")
+
+        ttk.Label(details_frame, text="Pause Q&A → Q&A (ms)\n(Merge mode only)",
+                  style="TLabel").grid(row=4, column=0, sticky="w", pady=(0, 5))
+        self.pause_qna_spin = ttk.Spinbox(
+            details_frame, from_=0, to=10000, increment=100,
+            textvariable=self.pause_qna_ms, style="TSpinbox", width=14,
+        )
+        self.pause_qna_spin.grid(row=4, column=1, sticky="w")
+
+        # 초기 활성 상태 설정
+        self._on_mode_change()
 
         # 4) Script Format Example
         preview_frame = ttk.LabelFrame(frm, text="4) Script Format Example",
@@ -648,6 +758,12 @@ class App:
 
 
     # -------------------------------------------------------------------------
+    def _on_mode_change(self):
+        """Merge 모드일 때만 'Pause Q&A → Q&A' 스핀박스를 활성화."""
+        state = "normal" if self.output_mode.get() == "merge" else "disabled"
+        if hasattr(self, "pause_qna_spin"):
+            self.pause_qna_spin.config(state=state)
+
     def browse_input(self):
         path = filedialog.askopenfilename(filetypes=[("Supported", "*.txt *.docx *.csv"), ("All files", "*.*")])
         if path:
@@ -684,7 +800,7 @@ class App:
 
         # ── 기존 출력 파일 존재 여부 확인 ──────────────────────────────────
         output_dir = Path(self.output_dir.get())
-        if output_dir.exists() and any(output_dir.glob("*_Q&A.mp3")):
+        if output_dir.exists() and any(output_dir.glob("*Q&A*.mp3")):
             result = messagebox.askyesnocancel(
                 "Output files already exist",
                 f"Q&A MP3 files already exist in:\n{output_dir}\n\n"
@@ -731,6 +847,18 @@ class App:
             candidate_voice_id = VOICE_PRESETS.get(
                 self.candidate_voice.get(), self.candidate_voice.get()
             )
+            # 설정 저장
+            save_config({
+                "input_path":        str(input_path),
+                "output_dir":        str(output_dir),
+                "interviewer_voice": self.interviewer_voice.get(),
+                "candidate_voice":   self.candidate_voice.get(),
+                "rate_pct":          self.rate_pct.get(),
+                "pitch_hz":          self.pitch_hz.get(),
+                "pause_ms":          self.pause_ms.get(),
+                "pause_qna_ms":      self.pause_qna_ms.get(),
+                "output_mode":       self.output_mode.get(),
+            })
             asyncio.run(generate_all(
                 segments=segments,
                 output_dir=output_dir,
@@ -739,6 +867,8 @@ class App:
                 rate_pct=self.rate_pct.get(),
                 pitch_hz=self.pitch_hz.get(),
                 pause_ms=self.pause_ms.get(),
+                pause_qna_ms=self.pause_qna_ms.get(),
+                output_mode=self.output_mode.get(),
                 status_cb=self.set_status,
                 cancel_event=self._cancel_event,
             ))
